@@ -45,7 +45,13 @@ class TextToSpeechProcessor:
         self.client = openai.OpenAI(api_key=self.api_key)
         self.temp_dir = Path(tempfile.mkdtemp())
     
-    def generate_speech(self, text: str, target_duration: Optional[float] = None) -> tuple[np.ndarray, int]:
+    def generate_speech(
+        self,
+        text: str,
+        target_duration: Optional[float] = None,
+        enable_time_stretch: bool = False,
+        stretch_threshold: float = 0.1
+    ) -> tuple[np.ndarray, int]:
         """
         Generate speech audio from text
         
@@ -75,13 +81,16 @@ class TextToSpeechProcessor:
             audio_data, sample_rate = librosa.load(temp_file, sr=None)
             
             # Adjust speed if target duration is specified
-            if target_duration and target_duration > 0:
+            if enable_time_stretch and target_duration and target_duration > 0:
                 current_duration = len(audio_data) / sample_rate
                 speed_ratio = current_duration / target_duration
                 
                 # Only adjust if the difference is significant (> 10%)
-                if abs(speed_ratio - 1.0) > 0.1:
-                    logger.debug(f"Adjusting speed: {speed_ratio:.2f}x")
+                if abs(speed_ratio - 1.0) > stretch_threshold:
+                    logger.debug(
+                        f"Applying TTS time stretch: ratio={speed_ratio:.2f}, "
+                        f"threshold={stretch_threshold:.2f}"
+                    )
                     audio_data = librosa.effects.time_stretch(audio_data, rate=speed_ratio)
             
             # Clean up temp file
@@ -93,7 +102,12 @@ class TextToSpeechProcessor:
             logger.error(f"Failed to generate speech: {e}")
             raise
     
-    def process_segments(self, segments: List[SpeechSegment]) -> List[AudioSegment]:
+    def process_segments(
+        self,
+        segments: List[SpeechSegment],
+        enable_time_stretch: bool = False,
+        stretch_threshold: float = 0.1
+    ) -> List[AudioSegment]:
         """
         Convert speech segments to audio segments
         
@@ -113,8 +127,10 @@ class TextToSpeechProcessor:
             try:
                 target_duration = segment.duration
                 audio_data, sample_rate = self.generate_speech(
-                    segment.text, 
-                    target_duration
+                    segment.text,
+                    target_duration,
+                    enable_time_stretch=enable_time_stretch,
+                    stretch_threshold=stretch_threshold
                 )
                 
                 audio_segment = AudioSegment(

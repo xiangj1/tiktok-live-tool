@@ -41,9 +41,8 @@ def cli(ctx, verbose):
 @click.argument('input_video', type=click.Path(exists=True))
 @click.argument('output_video', type=click.Path())
 @click.option('--api-key', help='OpenAI API key (or set OPENAI_API_KEY env var)')
-@click.option('--whisper-model', default='base', 
-              type=click.Choice(['tiny', 'base', 'small', 'medium', 'large']),
-              help='Whisper model to use for speech recognition')
+@click.option('--whisper-model', default='whisper-1',
+              help='OpenAI Whisper model to use for speech recognition (e.g., whisper-1)')
 @click.option('--openai-model', default='gpt-3.5-turbo',
               help='OpenAI model for text rephrasing')
 @click.option('--tts-voice', default='alloy',
@@ -114,9 +113,8 @@ def process(ctx, input_video, output_video, api_key, whisper_model, openai_model
 @cli.command()
 @click.argument('input_video', type=click.Path(exists=True))
 @click.option('--api-key', help='OpenAI API key (or set OPENAI_API_KEY env var)')
-@click.option('--whisper-model', default='base',
-              type=click.Choice(['tiny', 'base', 'small', 'medium', 'large']),
-              help='Whisper model to use for speech recognition')
+@click.option('--whisper-model', default='whisper-1',
+              help='OpenAI Whisper model to use for speech recognition (e.g., whisper-1)')
 @click.pass_context
 def analyze(ctx, input_video, api_key, whisper_model):
     """Analyze speech in video without processing"""
@@ -167,9 +165,8 @@ def analyze(ctx, input_video, api_key, whisper_model):
 @cli.command()
 @click.argument('input_video', type=click.Path(exists=True))
 @click.option('--api-key', help='OpenAI API key (or set OPENAI_API_KEY env var)')
-@click.option('--whisper-model', default='base',
-              type=click.Choice(['tiny', 'base', 'small', 'medium', 'large']),
-              help='Whisper model to use')
+@click.option('--whisper-model', default='whisper-1',
+              help='OpenAI Whisper model to use for speech recognition (e.g., whisper-1)')
 @click.option('--openai-model', default='gpt-3.5-turbo',
               help='OpenAI model for rephrasing')
 @click.pass_context

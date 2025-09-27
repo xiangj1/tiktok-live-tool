@@ -7,7 +7,14 @@ from pathlib import Path
 from typing import Optional
 import logging
 import numpy as np
-from moviepy.editor import VideoFileClip, AudioFileClip, CompositeAudioClip
+import subprocess
+from moviepy.editor import (
+    VideoFileClip,
+    AudioFileClip,
+    CompositeAudioClip,
+    concatenate_videoclips,
+    vfx,
+)
 import soundfile as sf
 from .text_to_speech import AudioSegment
 
@@ -85,8 +92,9 @@ class VideoEditor:
             logger.error(f"Failed to get video info: {e}")
             raise
     
-    def replace_audio(self, video_path: str, new_audio_path: str, 
-                     output_path: str, fade_duration: float = 0.1) -> str:
+    def replace_audio(self, video_path: str, new_audio_path: str,
+                     output_path: str, fade_duration: float = 0.1,
+                     fill_short_audio: bool = True) -> str:
         """
         Replace audio in video with new audio track
         
@@ -102,45 +110,61 @@ class VideoEditor:
         try:
             logger.info(f"Replacing audio in video: {video_path}")
             
-            # Load video (without audio)
+            # Load video to obtain metadata/duration
             video = VideoFileClip(video_path)
-            video_no_audio = video.without_audio()
-            
-            # Load new audio
-            new_audio = AudioFileClip(new_audio_path)
-            
-            # Adjust audio duration to match video
-            if new_audio.duration != video.duration:
-                if new_audio.duration > video.duration:
-                    # Trim audio
-                    new_audio = new_audio.subclip(0, video.duration)
-                else:
-                    # Loop audio if it's shorter (though this shouldn't happen in our case)
-                    loops_needed = int(video.duration / new_audio.duration) + 1
-                    new_audio = CompositeAudioClip([new_audio] * loops_needed).subclip(0, video.duration)
-            
-            # Apply fade effects to avoid clicks/pops
-            if fade_duration > 0:
-                new_audio = new_audio.audio_fadein(fade_duration).audio_fadeout(fade_duration)
-            
-            # Set the new audio to the video
-            final_video = video_no_audio.set_audio(new_audio)
-            
-            # Write the final video
-            final_video.write_videofile(
-                output_path,
-                codec='libx264',
-                audio_codec='aac',
-                verbose=False,
-                logger=None
-            )
-            
-            # Clean up
+            video_duration = video.duration
             video.close()
-            video_no_audio.close()
-            new_audio.close()
-            final_video.close()
-            
+
+            # Prepare audio clip with fades/duration adjustments
+            new_audio = AudioFileClip(new_audio_path)
+            audio_to_export = new_audio
+
+            duration_delta = new_audio.duration - video_duration
+            if abs(duration_delta) > 1e-3:
+                if new_audio.duration > video_duration:
+                    audio_to_export = new_audio.subclip(0, video_duration)
+                elif fill_short_audio:
+                    loops_needed = int(video_duration / new_audio.duration) + 1
+                    audio_to_export = CompositeAudioClip([new_audio] * loops_needed).subclip(0, video_duration)
+
+            if fade_duration > 0:
+                audio_to_export = audio_to_export.audio_fadein(fade_duration).audio_fadeout(fade_duration)
+
+            processed_audio_path = str(self.temp_dir / "processed_audio.wav")
+            audio_fps = getattr(audio_to_export, "fps", 44100)
+            audio_to_export.write_audiofile(processed_audio_path, fps=audio_fps, verbose=False, logger=None)
+
+            # Close audio clips
+            for clip in [audio_to_export, new_audio]:
+                try:
+                    clip.close()
+                except Exception:
+                    pass
+
+            # Ensure output directory exists
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
+            # Use ffmpeg to mux new audio while copying video stream to preserve metadata/aspect ratio
+            ffmpeg_cmd = [
+                "ffmpeg", "-y",
+                "-i", video_path,
+                "-i", processed_audio_path,
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-shortest",
+                output_path
+            ]
+
+            try:
+                subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            except subprocess.CalledProcessError as e:
+                stderr_output = e.stderr.decode('utf-8', errors='ignore') if e.stderr else str(e)
+                logger.error(f"Failed to replace audio via ffmpeg: {stderr_output}")
+                raise
+
             logger.info(f"Video with new audio saved to: {output_path}")
             return output_path
             
@@ -193,6 +217,117 @@ class VideoEditor:
             
         except Exception as e:
             logger.error(f"Failed to mix audio tracks: {e}")
+            raise
+
+    def get_audio_duration(self, audio_path: str) -> float:
+        """Return audio duration in seconds"""
+        info = sf.info(audio_path)
+        return float(info.duration)
+
+    def extend_video_with_reverse(self, video_path: str, target_duration: float,
+                                  output_path: str) -> str:
+        """Extend video by appending reverse playback until reaching target duration."""
+        try:
+            video_clip = VideoFileClip(video_path)
+            original_duration = video_clip.duration
+
+            if target_duration <= original_duration + 1e-3:
+                video_clip.close()
+                raise ValueError("Target duration must be greater than original duration for extension")
+
+            remaining = target_duration - original_duration
+            reversed_clip = video_clip.fx(vfx.time_mirror)
+            segments = [video_clip]
+
+            while remaining > 1e-3:
+                segment_duration = min(remaining, original_duration)
+                segment = reversed_clip.subclip(0, segment_duration)
+                segments.append(segment)
+                remaining -= segment_duration
+
+            final_clip = concatenate_videoclips(segments, method="compose")
+            final_clip.write_videofile(
+                output_path,
+                codec="libx264",
+                audio=False,
+                fps=video_clip.fps,
+                verbose=False,
+                logger=None
+            )
+
+            final_clip.close()
+            for clip in segments:
+                try:
+                    clip.close()
+                except Exception:
+                    pass
+            reversed_clip.close()
+
+            logger.info(
+                "Extended video saved to: %s (target duration %.2fs)",
+                output_path,
+                target_duration
+            )
+            return output_path
+
+        except Exception as e:
+            logger.error(f"Failed to extend video with reverse playback: {e}")
+            raise
+
+    def match_audio_loudness(self, reference_audio_path: str,
+                             target_audio_path: str,
+                             output_path: str,
+                             max_gain: float = 6.0,
+                             min_rms: float = 1e-4) -> str:
+        """
+        Adjust target audio loudness to match reference audio RMS level.
+
+        Args:
+            reference_audio_path: Path to reference audio (original video audio)
+            target_audio_path: Path to target audio (newly generated speech)
+            output_path: Path where adjusted audio will be saved
+            max_gain: Maximum amplification factor to prevent extreme boosts
+            min_rms: Minimum RMS threshold to avoid division by very small numbers
+
+        Returns:
+            Path to loudness-matched audio file
+        """
+        try:
+            ref_audio, ref_sr = sf.read(reference_audio_path)
+            tgt_audio, tgt_sr = sf.read(target_audio_path)
+
+            def _to_mono(audio: np.ndarray) -> np.ndarray:
+                if audio.ndim > 1:
+                    return np.mean(audio, axis=1)
+                return audio
+
+            ref_mono = _to_mono(ref_audio)
+            tgt_mono = _to_mono(tgt_audio)
+
+            ref_rms = np.sqrt(np.mean(np.square(ref_mono))) if len(ref_mono) > 0 else 0.0
+            tgt_rms = np.sqrt(np.mean(np.square(tgt_mono))) if len(tgt_mono) > 0 else 0.0
+
+            if ref_rms < min_rms or tgt_rms < min_rms:
+                logger.warning("RMS too low for reliable loudness matching, skipping adjustment")
+                sf.write(output_path, tgt_audio, tgt_sr)
+                return output_path
+
+            gain = ref_rms / tgt_rms
+            gain = np.clip(gain, 1.0 / max_gain, max_gain)
+
+            adjusted_audio = tgt_audio * gain
+            max_abs = np.max(np.abs(adjusted_audio))
+            if max_abs > 1.0:
+                adjusted_audio /= max_abs
+                logger.debug("Adjusted audio clipped; rescaled to prevent clipping")
+
+            sf.write(output_path, adjusted_audio, tgt_sr)
+            logger.info(
+                f"Matched audio loudness (gain applied: {gain:.2f}, ref RMS: {ref_rms:.4f}, target RMS: {tgt_rms:.4f})"
+            )
+            return output_path
+        except Exception as e:
+            logger.error(f"Failed to match audio loudness: {e}")
             raise
     
     def create_audio_from_segments(self, audio_segments: list, 

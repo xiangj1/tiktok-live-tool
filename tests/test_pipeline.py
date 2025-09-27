@@ -49,28 +49,37 @@ class TestProcessingConfig(unittest.TestCase):
         """Test default configuration values"""
         config = ProcessingConfig()
         
-        self.assertEqual(config.whisper_model, "base")
+        self.assertEqual(config.whisper_model, "whisper-1")
         self.assertEqual(config.openai_model, "gpt-3.5-turbo")
         self.assertEqual(config.tts_voice, "alloy")
         self.assertEqual(config.min_segment_duration, 2.0)
         self.assertEqual(config.max_timing_error, 1.0)
         self.assertFalse(config.preserve_original_audio)
+        self.assertFalse(config.allow_tts_time_stretch)
+        self.assertAlmostEqual(config.duration_match_tolerance, 0.01)
+        self.assertAlmostEqual(config.max_duration_overrun_ratio, 0.5)
     
     def test_custom_config(self):
         """Test custom configuration"""
         config = ProcessingConfig(
-            whisper_model="large",
+            whisper_model="whisper-large-v3",
             openai_model="gpt-4",
             tts_voice="nova",
             max_timing_error=0.5,
-            preserve_original_audio=True
+            preserve_original_audio=True,
+            allow_tts_time_stretch=True,
+            duration_match_tolerance=0.02,
+            max_duration_overrun_ratio=0.3
         )
         
-        self.assertEqual(config.whisper_model, "large")
+        self.assertEqual(config.whisper_model, "whisper-large-v3")
         self.assertEqual(config.openai_model, "gpt-4")
         self.assertEqual(config.tts_voice, "nova")
         self.assertEqual(config.max_timing_error, 0.5)
         self.assertTrue(config.preserve_original_audio)
+        self.assertTrue(config.allow_tts_time_stretch)
+        self.assertAlmostEqual(config.duration_match_tolerance, 0.02)
+        self.assertAlmostEqual(config.max_duration_overrun_ratio, 0.3)
 
 
 class TestSpeechToTextProcessor(unittest.TestCase):

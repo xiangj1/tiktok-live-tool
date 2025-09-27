@@ -18,8 +18,8 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ProcessingConfig:
     """Configuration for video processing pipeline"""
-    # Whisper model configuration
-    whisper_model: str = "base"
+    # Whisper model configuration (OpenAI API model name)
+    whisper_model: str = "whisper-1"
     
     # OpenAI API configuration
     openai_api_key: Optional[str] = None
@@ -30,6 +30,9 @@ class ProcessingConfig:
     min_segment_duration: float = 2.0
     max_timing_error: float = 1.0
     fade_duration: float = 0.1
+    allow_tts_time_stretch: bool = False
+    duration_match_tolerance: float = 0.01
+    max_duration_overrun_ratio: float = 0.5
     
     # Output settings
     preserve_original_audio: bool = False
@@ -61,7 +64,10 @@ class VideoProcessor:
         """Initialize all processors lazily"""
         if self.stt_processor is None:
             logger.info("Initializing Speech-to-Text processor...")
-            self.stt_processor = SpeechToTextProcessor(self.config.whisper_model)
+            self.stt_processor = SpeechToTextProcessor(
+                api_key=self.config.openai_api_key,
+                model_name=self.config.whisper_model
+            )
         
         if self.llm_rephraser is None:
             logger.info("Initializing LLM rephraser...")
@@ -127,7 +133,10 @@ class VideoProcessor:
             
             # Step 4: Convert rephrased text to speech
             logger.info("Step 4: Converting rephrased text to speech...")
-            audio_segments = self.tts_processor.process_segments(rephrased_segments)
+            audio_segments = self.tts_processor.process_segments(
+                rephrased_segments,
+                enable_time_stretch=self.config.allow_tts_time_stretch
+            )
             
             # Validate timing accuracy
             self._validate_timing(audio_segments, rephrased_segments)
@@ -140,6 +149,47 @@ class VideoProcessor:
                 total_duration,
                 new_audio_path
             )
+
+            # Match loudness to original audio
+            matched_audio_path = str(self.temp_dir / "new_audio_matched.wav")
+            new_audio_path = self.video_editor.match_audio_loudness(
+                extracted_audio_path,
+                new_audio_path,
+                matched_audio_path
+            )
+
+            # Align video duration with generated audio duration
+            audio_duration = self.video_editor.get_audio_duration(new_audio_path)
+            duration_delta = audio_duration - total_duration
+            tolerance = self.config.duration_match_tolerance
+            fill_short_audio = True
+            video_source_path = input_video_path
+
+            if duration_delta > tolerance:
+                max_allowed_overrun = total_duration * self.config.max_duration_overrun_ratio
+                if duration_delta > max_allowed_overrun:
+                    raise ValueError(
+                        f"Generated audio ({audio_duration:.2f}s) exceeds original video length "
+                        f"({total_duration:.2f}s) by more than the allowed ratio "
+                        f"({self.config.max_duration_overrun_ratio:.2f})."
+                    )
+
+                extended_video_path = str(self.temp_dir / "extended_video.mp4")
+                video_source_path = self.video_editor.extend_video_with_reverse(
+                    input_video_path,
+                    audio_duration,
+                    extended_video_path
+                )
+                logger.info(
+                    "Extended video by %.2fs using reverse playback to match audio duration.",
+                    duration_delta
+                )
+            elif duration_delta < -tolerance:
+                fill_short_audio = False
+                logger.info(
+                    "Trimming video by %.2fs to match shorter generated audio.",
+                    abs(duration_delta)
+                )
             
             # Step 6: Handle audio mixing if preserving original
             final_audio_path = new_audio_path
@@ -157,10 +207,11 @@ class VideoProcessor:
             # Step 7: Replace audio in video
             logger.info("Step 7: Replacing audio in video...")
             final_video_path = self.video_editor.replace_audio(
-                input_video_path,
+                video_source_path,
                 final_audio_path,
                 output_video_path,
-                self.config.fade_duration
+                self.config.fade_duration,
+                fill_short_audio=fill_short_audio
             )
             
             logger.info(f"Video processing completed: {final_video_path}")

@@ -89,8 +89,9 @@ from video_processor import VideoProcessor, ProcessingConfig
 config = ProcessingConfig(
     whisper_model="base",
     openai_model="gpt-3.5-turbo",
-    tts_voice="alloy",
-    max_timing_error=1.0
+  tts_voice="alloy",
+  max_timing_error=1.0,
+  allow_tts_time_stretch=True  # optional: re-enable audio stretching if preferred
 )
 
 # Process video
@@ -127,6 +128,8 @@ result = processor.process_video("input.mp4", "output.mp4")
 - Default 1-second tolerance works for most content
 - Use smaller `--max-timing-error` for precise synchronization
 - Very short segments may have larger timing variations
+- When generated speech ends sooner, the video tail is trimmed automatically; when speech runs longer (within reasonable bounds), the video extends using reverse playback to keep everything aligned.
+- Time-stretching of TTS audio is disabled by default to preserve natural voice tone; you can re-enable it via `ProcessingConfig(allow_tts_time_stretch=True)` if you prefer audio stretching over video trimming/extensions.
 
 ## Troubleshooting
 
