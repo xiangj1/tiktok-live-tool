@@ -1,0 +1,273 @@
+"""
+Main pipeline for video speech processing
+"""
+import os
+import tempfile
+from pathlib import Path
+from typing import Optional, List
+import logging
+from dataclasses import dataclass
+from .speech_to_text import SpeechToTextProcessor, SpeechSegment
+from .llm_rephraser import LLMRephraser
+from .text_to_speech import TextToSpeechProcessor, AudioSegment
+from .video_editor import VideoEditor
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+@dataclass
+class ProcessingConfig:
+    """Configuration for video processing pipeline"""
+    # Whisper model configuration
+    whisper_model: str = "base"
+    
+    # OpenAI API configuration
+    openai_api_key: Optional[str] = None
+    openai_model: str = "gpt-3.5-turbo"
+    tts_voice: str = "alloy"
+    
+    # Processing parameters
+    min_segment_duration: float = 2.0
+    max_timing_error: float = 1.0
+    fade_duration: float = 0.1
+    
+    # Output settings
+    preserve_original_audio: bool = False
+    original_audio_volume: float = 0.1
+    new_audio_volume: float = 1.0
+
+class VideoProcessor:
+    """Main pipeline for processing videos with speech rephrasing"""
+    
+    def __init__(self, config: Optional[ProcessingConfig] = None):
+        """
+        Initialize the video processor
+        
+        Args:
+            config: Processing configuration
+        """
+        self.config = config or ProcessingConfig()
+        self.temp_dir = Path(tempfile.mkdtemp())
+        
+        # Initialize processors
+        self.stt_processor = None
+        self.llm_rephraser = None
+        self.tts_processor = None
+        self.video_editor = None
+        
+        logger.info(f"VideoProcessor initialized with temp dir: {self.temp_dir}")
+    
+    def _initialize_processors(self):
+        """Initialize all processors lazily"""
+        if self.stt_processor is None:
+            logger.info("Initializing Speech-to-Text processor...")
+            self.stt_processor = SpeechToTextProcessor(self.config.whisper_model)
+        
+        if self.llm_rephraser is None:
+            logger.info("Initializing LLM rephraser...")
+            self.llm_rephraser = LLMRephraser(
+                api_key=self.config.openai_api_key,
+                model=self.config.openai_model
+            )
+        
+        if self.tts_processor is None:
+            logger.info("Initializing Text-to-Speech processor...")
+            self.tts_processor = TextToSpeechProcessor(
+                api_key=self.config.openai_api_key,
+                voice=self.config.tts_voice
+            )
+        
+        if self.video_editor is None:
+            logger.info("Initializing Video editor...")
+            self.video_editor = VideoEditor()
+    
+    def process_video(self, input_video_path: str, output_video_path: str) -> str:
+        """
+        Process video with speech rephrasing
+        
+        Args:
+            input_video_path: Path to input video file
+            output_video_path: Path for output video file
+            
+        Returns:
+            Path to processed video
+        """
+        try:
+            logger.info(f"Starting video processing: {input_video_path}")
+            
+            # Initialize processors
+            self._initialize_processors()
+            
+            # Step 1: Extract audio from video
+            logger.info("Step 1: Extracting audio from video...")
+            extracted_audio_path = self.video_editor.extract_audio(
+                input_video_path,
+                str(self.temp_dir / "original_audio.wav")
+            )
+            
+            # Get video information
+            video_info = self.video_editor.get_video_info(input_video_path)
+            total_duration = video_info["duration"]
+            logger.info(f"Video duration: {total_duration:.2f} seconds")
+            
+            # Step 2: Speech-to-text with timestamps
+            logger.info("Step 2: Converting speech to text with timestamps...")
+            speech_segments = self.stt_processor.process_audio_file(extracted_audio_path)
+            
+            if not speech_segments:
+                raise ValueError("No speech detected in the video")
+            
+            logger.info(f"Extracted {len(speech_segments)} speech segments")
+            self._log_segments(speech_segments, "Original")
+            
+            # Step 3: Rephrase text using LLM
+            logger.info("Step 3: Rephrasing text using LLM...")
+            rephrased_segments = self.llm_rephraser.rephrase_segments(speech_segments)
+            self._log_segments(rephrased_segments, "Rephrased")
+            
+            # Step 4: Convert rephrased text to speech
+            logger.info("Step 4: Converting rephrased text to speech...")
+            audio_segments = self.tts_processor.process_segments(rephrased_segments)
+            
+            # Validate timing accuracy
+            self._validate_timing(audio_segments, rephrased_segments)
+            
+            # Step 5: Create new audio track
+            logger.info("Step 5: Creating new audio track...")
+            new_audio_path = str(self.temp_dir / "new_audio.wav")
+            self.video_editor.create_audio_from_segments(
+                audio_segments,
+                total_duration,
+                new_audio_path
+            )
+            
+            # Step 6: Handle audio mixing if preserving original
+            final_audio_path = new_audio_path
+            if self.config.preserve_original_audio:
+                logger.info("Step 6: Mixing with original audio...")
+                mixed_audio_path = str(self.temp_dir / "mixed_audio.wav")
+                final_audio_path = self.video_editor.mix_audio_tracks(
+                    extracted_audio_path,
+                    new_audio_path,
+                    mixed_audio_path,
+                    self.config.new_audio_volume,
+                    self.config.original_audio_volume
+                )
+            
+            # Step 7: Replace audio in video
+            logger.info("Step 7: Replacing audio in video...")
+            final_video_path = self.video_editor.replace_audio(
+                input_video_path,
+                final_audio_path,
+                output_video_path,
+                self.config.fade_duration
+            )
+            
+            logger.info(f"Video processing completed: {final_video_path}")
+            return final_video_path
+            
+        except Exception as e:
+            logger.error(f"Video processing failed: {e}")
+            raise
+        finally:
+            # Cleanup
+            self.cleanup()
+    
+    def _log_segments(self, segments: List[SpeechSegment], label: str):
+        """Log segment information for debugging"""
+        logger.info(f"{label} segments:")
+        for i, segment in enumerate(segments[:5]):  # Log first 5 segments
+            logger.info(f"  {i+1}: [{segment.start:.2f}s-{segment.end:.2f}s] {segment.text[:100]}...")
+        if len(segments) > 5:
+            logger.info(f"  ... and {len(segments) - 5} more segments")
+    
+    def _validate_timing(self, audio_segments: List[AudioSegment], 
+                        original_segments: List[SpeechSegment]):
+        """Validate timing accuracy of generated audio"""
+        timing_errors = []
+        
+        for audio_seg, orig_seg in zip(audio_segments, original_segments):
+            target_duration = orig_seg.duration
+            actual_duration = audio_seg.duration
+            error = abs(actual_duration - target_duration)
+            timing_errors.append(error)
+            
+            if error > self.config.max_timing_error:
+                logger.warning(
+                    f"Timing error exceeds threshold: {error:.2f}s > {self.config.max_timing_error}s "
+                    f"for segment '{orig_seg.text[:50]}...'"
+                )
+        
+        avg_error = sum(timing_errors) / len(timing_errors) if timing_errors else 0
+        max_error = max(timing_errors) if timing_errors else 0
+        
+        logger.info(f"Timing validation - Average error: {avg_error:.3f}s, Max error: {max_error:.3f}s")
+        
+        if max_error > self.config.max_timing_error:
+            logger.warning(f"Some segments exceed maximum timing error of {self.config.max_timing_error}s")
+    
+    def extract_and_analyze_speech(self, video_path: str) -> List[SpeechSegment]:
+        """
+        Extract and analyze speech from video (for testing/preview)
+        
+        Args:
+            video_path: Path to video file
+            
+        Returns:
+            List of speech segments
+        """
+        try:
+            self._initialize_processors()
+            
+            # Extract audio
+            audio_path = self.video_editor.extract_audio(
+                video_path,
+                str(self.temp_dir / "temp_audio.wav")
+            )
+            
+            # Process speech
+            segments = self.stt_processor.process_audio_file(audio_path)
+            
+            return segments
+            
+        except Exception as e:
+            logger.error(f"Speech analysis failed: {e}")
+            raise
+    
+    def preview_rephrasing(self, segments: List[SpeechSegment]) -> List[SpeechSegment]:
+        """
+        Preview rephrasing without processing video
+        
+        Args:
+            segments: Original speech segments
+            
+        Returns:
+            Rephrased segments
+        """
+        try:
+            self._initialize_processors()
+            return self.llm_rephraser.rephrase_segments(segments)
+        except Exception as e:
+            logger.error(f"Rephrasing preview failed: {e}")
+            raise
+    
+    def cleanup(self):
+        """Clean up temporary files and resources"""
+        try:
+            # Cleanup individual processors
+            if self.tts_processor:
+                self.tts_processor.cleanup()
+            if self.video_editor:
+                self.video_editor.cleanup()
+            
+            # Cleanup temp directory
+            import shutil
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
+            logger.info("Cleanup completed")
+            
+        except Exception as e:
+            logger.warning(f"Cleanup failed: {e}")
+    
+    def __del__(self):
+        """Destructor to ensure cleanup"""
+        self.cleanup()
