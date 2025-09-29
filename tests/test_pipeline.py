@@ -55,9 +55,14 @@ class TestProcessingConfig(unittest.TestCase):
         self.assertEqual(config.min_segment_duration, 2.0)
         self.assertEqual(config.max_timing_error, 1.0)
         self.assertFalse(config.preserve_original_audio)
-        self.assertFalse(config.allow_tts_time_stretch)
         self.assertAlmostEqual(config.duration_match_tolerance, 0.01)
         self.assertAlmostEqual(config.max_duration_overrun_ratio, 0.5)
+        self.assertEqual(config.tts_max_attempts, 3)
+        self.assertAlmostEqual(config.tts_duration_tolerance_ratio, 0.12)
+        self.assertAlmostEqual(config.tts_retry_backoff_seconds, 2.5)
+        self.assertEqual(config.max_rephrase_attempts, 2)
+        self.assertAlmostEqual(config.rephrase_words_per_second, 2.5)
+        self.assertAlmostEqual(config.rephrase_length_ratio, 0.9)
     
     def test_custom_config(self):
         """Test custom configuration"""
@@ -67,9 +72,14 @@ class TestProcessingConfig(unittest.TestCase):
             tts_voice="nova",
             max_timing_error=0.5,
             preserve_original_audio=True,
-            allow_tts_time_stretch=True,
             duration_match_tolerance=0.02,
-            max_duration_overrun_ratio=0.3
+            max_duration_overrun_ratio=0.3,
+            tts_max_attempts=4,
+            tts_duration_tolerance_ratio=0.08,
+            tts_retry_backoff_seconds=3.0,
+            max_rephrase_attempts=3,
+            rephrase_words_per_second=2.0,
+            rephrase_length_ratio=0.8
         )
         
         self.assertEqual(config.whisper_model, "whisper-large-v3")
@@ -77,9 +87,14 @@ class TestProcessingConfig(unittest.TestCase):
         self.assertEqual(config.tts_voice, "nova")
         self.assertEqual(config.max_timing_error, 0.5)
         self.assertTrue(config.preserve_original_audio)
-        self.assertTrue(config.allow_tts_time_stretch)
         self.assertAlmostEqual(config.duration_match_tolerance, 0.02)
         self.assertAlmostEqual(config.max_duration_overrun_ratio, 0.3)
+        self.assertEqual(config.tts_max_attempts, 4)
+        self.assertAlmostEqual(config.tts_duration_tolerance_ratio, 0.08)
+        self.assertAlmostEqual(config.tts_retry_backoff_seconds, 3.0)
+        self.assertEqual(config.max_rephrase_attempts, 3)
+        self.assertAlmostEqual(config.rephrase_words_per_second, 2.0)
+        self.assertAlmostEqual(config.rephrase_length_ratio, 0.8)
 
 
 class TestSpeechToTextProcessor(unittest.TestCase):

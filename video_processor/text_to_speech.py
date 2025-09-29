@@ -1,17 +1,37 @@
 """
 Text-to-Speech processor using OpenAI TTS API
 """
-import openai
-import os
-from typing import List, Optional
 import logging
+import os
 import tempfile
-from pathlib import Path
-import librosa
-import soundfile as sf
-import numpy as np
+import time
 from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+import librosa
+import numpy as np
+import openai
+
 from .speech_to_text import SpeechSegment
+
+
+class TTSDurationMismatch(Exception):
+    """Raised when generated TTS audio stays outside the allowed duration tolerance."""
+
+    def __init__(
+        self,
+        message: str,
+        audio_data: np.ndarray,
+        sample_rate: int,
+        target_duration: float,
+        actual_duration: float,
+    ):
+        super().__init__(message)
+        self.audio_data = audio_data
+        self.sample_rate = sample_rate
+        self.target_duration = target_duration
+        self.actual_duration = actual_duration
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -49,9 +69,11 @@ class TextToSpeechProcessor:
         self,
         text: str,
         target_duration: Optional[float] = None,
-        enable_time_stretch: bool = False,
-        stretch_threshold: float = 0.1
-    ) -> tuple[np.ndarray, int]:
+        *,
+        max_attempts: int = 1,
+        duration_tolerance_ratio: float = 0.15,
+        backoff_seconds: float = 2.0,
+    ) -> Tuple[np.ndarray, int]:
         """
         Generate speech audio from text
         
@@ -62,51 +84,82 @@ class TextToSpeechProcessor:
         Returns:
             Tuple of (audio_data, sample_rate)
         """
-        try:
-            logger.debug(f"Generating speech for: {text[:50]}...")
-            
-            # Generate speech using OpenAI TTS
-            response = self.client.audio.speech.create(
-                model="tts-1",
-                voice=self.voice,
-                input=text,
-                response_format="mp3"
-            )
-            
-            # Save to temporary file
-            temp_file = self.temp_dir / f"tts_{hash(text)}.mp3"
-            response.stream_to_file(temp_file)
-            
-            # Load audio data
-            audio_data, sample_rate = librosa.load(temp_file, sr=None)
-            
-            # Adjust speed if target duration is specified
-            if enable_time_stretch and target_duration and target_duration > 0:
-                current_duration = len(audio_data) / sample_rate
-                speed_ratio = current_duration / target_duration
-                
-                # Only adjust if the difference is significant (> 10%)
-                if abs(speed_ratio - 1.0) > stretch_threshold:
-                    logger.debug(
-                        f"Applying TTS time stretch: ratio={speed_ratio:.2f}, "
-                        f"threshold={stretch_threshold:.2f}"
-                    )
-                    audio_data = librosa.effects.time_stretch(audio_data, rate=speed_ratio)
-            
-            # Clean up temp file
-            temp_file.unlink(missing_ok=True)
-            
-            return audio_data, sample_rate
-            
-        except Exception as e:
-            logger.error(f"Failed to generate speech: {e}")
-            raise
+        attempt = 0
+        last_error: Optional[Exception] = None
+
+        while attempt < max_attempts:
+            attempt += 1
+            try:
+                logger.debug(
+                    "Generating speech attempt %d/%d for segment '%.50s'...",
+                    attempt,
+                    max_attempts,
+                    text,
+                )
+
+                response = self.client.audio.speech.create(
+                    model="tts-1",
+                    voice=self.voice,
+                    input=text,
+                    response_format="mp3"
+                )
+
+                temp_file = self.temp_dir / f"tts_{hash((text, attempt))}.mp3"
+                response.stream_to_file(temp_file)
+
+                audio_data, sample_rate = librosa.load(temp_file, sr=None)
+                temp_file.unlink(missing_ok=True)
+
+                if target_duration and target_duration > 0:
+                    current_duration = len(audio_data) / sample_rate
+                    ratio = current_duration / target_duration if target_duration else 1.0
+
+                    if abs(ratio - 1.0) > duration_tolerance_ratio:
+                        logger.warning(
+                            "TTS duration ratio %.2f outside tolerance ±%.2f (target %.2fs, actual %.2fs)",
+                            ratio,
+                            duration_tolerance_ratio,
+                            target_duration,
+                            current_duration,
+                        )
+
+                        if attempt < max_attempts:
+                            time.sleep(backoff_seconds)
+                            continue
+
+                        raise TTSDurationMismatch(
+                            "Generated TTS audio remains outside tolerance after retries",
+                            audio_data,
+                            sample_rate,
+                            target_duration,
+                            current_duration,
+                        )
+
+                return audio_data, sample_rate
+
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    "TTS attempt %d/%d failed: %s",
+                    attempt,
+                    max_attempts,
+                    e,
+                )
+                if attempt < max_attempts:
+                    time.sleep(backoff_seconds)
+
+        logger.error("All TTS attempts failed for segment: %.50s", text)
+        if last_error:
+            raise last_error
+        raise RuntimeError("Unknown TTS failure")
     
     def process_segments(
         self,
         segments: List[SpeechSegment],
-        enable_time_stretch: bool = False,
-        stretch_threshold: float = 0.1
+        *,
+        max_attempts: int = 1,
+        duration_tolerance_ratio: float = 0.15,
+        retry_backoff_seconds: float = 2.0
     ) -> List[AudioSegment]:
         """
         Convert speech segments to audio segments
@@ -129,8 +182,9 @@ class TextToSpeechProcessor:
                 audio_data, sample_rate = self.generate_speech(
                     segment.text,
                     target_duration,
-                    enable_time_stretch=enable_time_stretch,
-                    stretch_threshold=stretch_threshold
+                    max_attempts=max_attempts,
+                    duration_tolerance_ratio=duration_tolerance_ratio,
+                    backoff_seconds=retry_backoff_seconds,
                 )
                 
                 audio_segment = AudioSegment(
@@ -166,69 +220,6 @@ class TextToSpeechProcessor:
         
         logger.info("TTS processing completed")
         return audio_segments
-    
-    def create_full_audio_track(self, audio_segments: List[AudioSegment], 
-                               total_duration: float, 
-                               sample_rate: int = 22050) -> np.ndarray:
-        """
-        Create a complete audio track from segments
-        
-        Args:
-            audio_segments: List of audio segments
-            total_duration: Total duration of the output audio
-            sample_rate: Target sample rate
-            
-        Returns:
-            Complete audio track as numpy array
-        """
-        total_samples = int(total_duration * sample_rate)
-        full_audio = np.zeros(total_samples)
-        
-        for segment in audio_segments:
-            start_sample = int(segment.start * sample_rate)
-            end_sample = int(segment.end * sample_rate)
-            
-            # Resample audio if necessary
-            if segment.sample_rate != sample_rate:
-                resampled_audio = librosa.resample(
-                    segment.audio_data,
-                    orig_sr=segment.sample_rate,
-                    target_sr=sample_rate
-                )
-            else:
-                resampled_audio = segment.audio_data
-            
-            # Adjust length to fit exactly in the time slot
-            target_length = end_sample - start_sample
-            if len(resampled_audio) != target_length:
-                if len(resampled_audio) > target_length:
-                    # Trim audio
-                    resampled_audio = resampled_audio[:target_length]
-                else:
-                    # Pad with silence
-                    padding = target_length - len(resampled_audio)
-                    resampled_audio = np.pad(resampled_audio, (0, padding), mode='constant')
-            
-            # Place audio in the correct position
-            full_audio[start_sample:end_sample] = resampled_audio
-        
-        return full_audio
-    
-    def save_audio(self, audio_data: np.ndarray, sample_rate: int, output_path: str):
-        """
-        Save audio data to file
-        
-        Args:
-            audio_data: Audio data as numpy array
-            sample_rate: Sample rate
-            output_path: Output file path
-        """
-        try:
-            sf.write(output_path, audio_data, sample_rate)
-            logger.info(f"Audio saved to: {output_path}")
-        except Exception as e:
-            logger.error(f"Failed to save audio: {e}")
-            raise
     
     def cleanup(self):
         """Clean up temporary files"""

@@ -43,7 +43,12 @@ class LLMRephraser:
 
 Please provide only the rephrased text without any explanations or additional comments."""
     
-    def rephrase_text(self, text: str, max_retries: int = 3) -> str:
+    def rephrase_text(
+        self,
+        text: str,
+        max_retries: int = 3,
+        max_words: Optional[int] = None,
+    ) -> str:
         """
         Rephrase a single text segment
         
@@ -61,13 +66,25 @@ Please provide only the rephrased text without any explanations or additional co
             try:
                 logger.debug(f"Rephrasing (attempt {attempt + 1}): {text[:50]}...")
                 
+                user_prompt = (
+                    f"Rephrase this text so it remains natural for speech and preserves meaning: {text}"
+                )
+                if max_words is not None:
+                    user_prompt = (
+                        "Rephrase this text so it remains natural for speech, preserves meaning, "
+                        f"and uses no more than {max_words} words. Remove non-essential details if needed.\n\n{text}"
+                    )
+
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=[
                         {"role": "system", "content": self.system_prompt},
-                        {"role": "user", "content": f"Rephrase this text: {text}"}
+                        {"role": "user", "content": user_prompt}
                     ],
-                    max_tokens=min(len(text.split()) * 3, 500),  # Adaptive token limit
+                    max_tokens=min(
+                        int((max_words if max_words else len(text.split())) * 3),
+                        500,
+                    ),  # Adaptive token limit
                     temperature=0.7,
                     top_p=0.9
                 )

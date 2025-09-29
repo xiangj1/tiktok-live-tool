@@ -7,9 +7,10 @@ from pathlib import Path
 from typing import Optional, List
 import logging
 from dataclasses import dataclass
+import numpy as np
 from .speech_to_text import SpeechToTextProcessor, SpeechSegment
 from .llm_rephraser import LLMRephraser
-from .text_to_speech import TextToSpeechProcessor, AudioSegment
+from .text_to_speech import TextToSpeechProcessor, AudioSegment, TTSDurationMismatch
 from .video_editor import VideoEditor
 
 logging.basicConfig(level=logging.INFO)
@@ -30,9 +31,14 @@ class ProcessingConfig:
     min_segment_duration: float = 2.0
     max_timing_error: float = 1.0
     fade_duration: float = 0.1
-    allow_tts_time_stretch: bool = False
     duration_match_tolerance: float = 0.01
     max_duration_overrun_ratio: float = 0.5
+    tts_max_attempts: int = 3
+    tts_duration_tolerance_ratio: float = 0.12
+    tts_retry_backoff_seconds: float = 2.5
+    max_rephrase_attempts: int = 2
+    rephrase_words_per_second: float = 2.5
+    rephrase_length_ratio: float = 0.9
     
     # Output settings
     preserve_original_audio: bool = False
@@ -133,11 +139,13 @@ class VideoProcessor:
             
             # Step 4: Convert rephrased text to speech
             logger.info("Step 4: Converting rephrased text to speech...")
-            audio_segments = self.tts_processor.process_segments(
-                rephrased_segments,
-                enable_time_stretch=self.config.allow_tts_time_stretch
+            audio_segments, adjusted_segments = self._synthesize_segments_with_rephrase(
+                rephrased_segments
             )
-            
+
+            rephrased_segments = adjusted_segments
+            self._log_segments(rephrased_segments, "Adjusted rephrased")
+
             # Validate timing accuracy
             self._validate_timing(audio_segments, rephrased_segments)
             
@@ -232,6 +240,142 @@ class VideoProcessor:
         if len(segments) > 5:
             logger.info(f"  ... and {len(segments) - 5} more segments")
     
+    def _estimate_max_words(self, duration: float) -> int:
+        base_words = duration * self.config.rephrase_words_per_second * self.config.rephrase_length_ratio
+        if base_words <= 0:
+            return 5
+        return max(5, int(round(base_words)))
+
+    def _synthesize_segments_with_rephrase(
+        self,
+        segments: List[SpeechSegment],
+    ) -> tuple[List[AudioSegment], List[SpeechSegment]]:
+        audio_segments: List[AudioSegment] = []
+        adjusted_segments: List[SpeechSegment] = []
+
+        for idx, segment in enumerate(segments):
+            logger.info("Generating TTS for segment %d/%d", idx + 1, len(segments))
+
+            current_text = segment.text
+            for rephrase_attempt in range(self.config.max_rephrase_attempts + 1):
+                try:
+                    audio_data, sample_rate = self.tts_processor.generate_speech(
+                        current_text,
+                        segment.duration,
+                        max_attempts=self.config.tts_max_attempts,
+                        duration_tolerance_ratio=self.config.tts_duration_tolerance_ratio,
+                        backoff_seconds=self.config.tts_retry_backoff_seconds,
+                    )
+
+                    audio_segments.append(
+                        AudioSegment(
+                            audio_data=audio_data,
+                            sample_rate=sample_rate,
+                            start=segment.start,
+                            end=segment.end,
+                            duration=len(audio_data) / sample_rate,
+                        )
+                    )
+                    adjusted_segments.append(
+                        SpeechSegment(
+                            text=current_text,
+                            start=segment.start,
+                            end=segment.end,
+                            confidence=segment.confidence,
+                        )
+                    )
+                    break
+
+                except TTSDurationMismatch as mismatch:
+                    if rephrase_attempt >= self.config.max_rephrase_attempts:
+                        logger.warning(
+                            "Segment %d remains outside duration tolerance after rephrase attempts; "
+                            "using longest available audio.",
+                            idx + 1,
+                        )
+
+                        audio_segments.append(
+                            AudioSegment(
+                                audio_data=mismatch.audio_data,
+                                sample_rate=mismatch.sample_rate,
+                                start=segment.start,
+                                end=segment.end,
+                                duration=mismatch.actual_duration,
+                            )
+                        )
+                        adjusted_segments.append(
+                            SpeechSegment(
+                                text=current_text,
+                                start=segment.start,
+                                end=segment.end,
+                                confidence=segment.confidence,
+                            )
+                        )
+                        break
+
+                    max_words = self._estimate_max_words(segment.duration)
+                    logger.info(
+                        "Rephrasing segment %d to fit within ~%d words",
+                        idx + 1,
+                        max_words,
+                    )
+                    current_text = self.llm_rephraser.rephrase_text(
+                        current_text,
+                        max_words=max_words,
+                    )
+
+                except Exception as e:
+                    logger.error(
+                        "Failed to synthesize segment %d: %s. Inserting silence as fallback.",
+                        idx + 1,
+                        e,
+                    )
+                    silence_sr = 22050
+                    silence_samples = int(segment.duration * silence_sr)
+                    silence_audio = np.zeros(silence_samples, dtype=np.float32)
+
+                    audio_segments.append(
+                        AudioSegment(
+                            audio_data=silence_audio,
+                            sample_rate=silence_sr,
+                            start=segment.start,
+                            end=segment.end,
+                            duration=segment.duration,
+                        )
+                    )
+                    adjusted_segments.append(
+                        SpeechSegment(
+                            text=current_text,
+                            start=segment.start,
+                            end=segment.end,
+                            confidence=segment.confidence,
+                        )
+                    )
+                    break
+
+            else:
+                # This point is reached only if the for-loop completes without break
+                logger.warning(
+                    "Unexpected TTS loop exit for segment %d; inserting silence.",
+                    idx + 1,
+                )
+                silence_sr = 22050
+                silence_samples = int(segment.duration * silence_sr)
+                silence_audio = np.zeros(silence_samples, dtype=np.float32)
+
+                audio_segments.append(
+                    AudioSegment(
+                        audio_data=silence_audio,
+                        sample_rate=silence_sr,
+                        start=segment.start,
+                        end=segment.end,
+                        duration=segment.duration,
+                    )
+                )
+                adjusted_segments.append(segment)
+
+        return audio_segments, adjusted_segments
+
     def _validate_timing(self, audio_segments: List[AudioSegment], 
                         original_segments: List[SpeechSegment]):
         """Validate timing accuracy of generated audio"""
